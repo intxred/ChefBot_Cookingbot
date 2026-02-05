@@ -12,6 +12,10 @@ API_KEY = os.getenv("GENAI_API_KEY")
 
 client = genai.Client(api_key=API_KEY)
 
+# === Conversation Storage ===
+# In-memory storage for conversations (use Redis/database for production)
+conversations = {}
+
 # === System Prompt ===
 SYSTEM_PROMPT = """
 You are ChefBot, an expert cooking assistant with extensive culinary knowledge.
@@ -34,7 +38,7 @@ Guidelines:
 4. Provide clear, step-by-step instructions when explaining recipes
 5. Offer helpful tips and tricks when appropriate
 6. If you don't know something food-related, be honest and suggest alternatives
-7. Don't forget and remember the previous conversation or response.
+7. Remember the conversation history and refer back to previous messages when relevant
 
 Remember: You are a cooking expert, not a general-purpose assistant.
 """
@@ -77,6 +81,75 @@ def clean_markdown(text: str) -> str:
     
     return text.strip()
 
+def get_conversation_history(session_id: str) -> list:
+    """
+    Retrieves conversation history for a given session
+    
+    Args:
+        session_id: Unique identifier for the conversation session
+        
+    Returns:
+        List of conversation messages
+    """
+    if session_id not in conversations:
+        conversations[session_id] = []
+    return conversations[session_id]
+
+def build_conversation_prompt(session_id: str, user_input: str) -> str:
+    """
+    Builds a full prompt including system prompt and conversation history
+    
+    Args:
+        session_id: Unique identifier for the conversation session
+        user_input: Latest user message
+        
+    Returns:
+        Full prompt string with conversation context
+    """
+    history = get_conversation_history(session_id)
+    
+    # Start with system prompt
+    prompt = SYSTEM_PROMPT + "\n\n"
+    
+    # Add conversation history
+    if history:
+        prompt += "Previous conversation:\n"
+        for msg in history:
+            prompt += f"{msg['role']}: {msg['content']}\n"
+        prompt += "\n"
+    
+    # Add current user input
+    prompt += f"User: {user_input}\n\nChefBot:"
+    
+    return prompt
+
+def save_to_history(session_id: str, user_input: str, bot_response: str):
+    """
+    Saves user message and bot response to conversation history
+    
+    Args:
+        session_id: Unique identifier for the conversation session
+        user_input: User's message
+        bot_response: Bot's response
+    """
+    history = get_conversation_history(session_id)
+    
+    # Add user message
+    history.append({
+        "role": "User",
+        "content": user_input
+    })
+    
+    # Add bot response
+    history.append({
+        "role": "ChefBot",
+        "content": bot_response
+    })
+    
+    # Optional: Limit history to last 20 messages (10 exchanges) to avoid token limits
+    if len(history) > 20:
+        conversations[session_id] = history[-20:]
+
 @app.route("/", methods=["GET"])
 def home():
     """
@@ -85,28 +158,32 @@ def home():
     return jsonify({
         "status": "running",
         "message": "ChefBot Flask server is running",
-        "version": "1.0.0"
+        "version": "2.0.0",
+        "features": ["conversation_memory", "session_management"]
     })
 
 @app.route("/chat", methods=["POST"])
 def chat():
     """
-    Main chat endpoint for processing user messages
+    Main chat endpoint for processing user messages with conversation memory
     
     Expected JSON payload:
     {
-        "user_input": "How do I make pasta carbonara?"
+        "user_input": "How do I make pasta carbonara?",
+        "session_id": "unique-session-id"  // Optional, will be generated if not provided
     }
     
     Returns JSON response:
     {
-        "response": "To make pasta carbonara..."
+        "response": "To make pasta carbonara...",
+        "session_id": "unique-session-id"
     }
     """
     try:
         # Get user input from request
         data = request.json
         user_input = data.get("user_input", "").strip()
+        session_id = data.get("session_id", "default")
         
         # Validate input
         if not user_input:
@@ -115,8 +192,8 @@ def chat():
                 "message": "Please provide a message in 'user_input' field"
             }), 400
         
-        # Build the full prompt
-        full_prompt = f"{SYSTEM_PROMPT}\n\nUser: {user_input}\n\nChefBot:"
+        # Build the full prompt with conversation history
+        full_prompt = build_conversation_prompt(session_id, user_input)
         
         # Call Gemini API
         response = client.models.generate_content(
@@ -133,7 +210,14 @@ def chat():
         # Extract and clean response text
         if response and response.text:
             clean_response = clean_markdown(response.text)
-            return jsonify({"response": clean_response})
+            
+            # Save conversation to history
+            save_to_history(session_id, user_input, clean_response)
+            
+            return jsonify({
+                "response": clean_response,
+                "session_id": session_id
+            })
         else:
             return jsonify({
                 "error": "Empty response from AI",
@@ -147,7 +231,7 @@ def chat():
         if "RESOURCE_EXHAUSTED" in error_msg or "429" in error_msg or "quota" in error_msg.lower():
             return jsonify({
                 "error": "Quota exceeded",
-                "response": "ChefBot has reached its daily cooking limit 🍳🔥 Please try again tomorrow or use a different API key."
+                "response": "ChefBot has reached its daily cooking limit, Please try again tomorrow."
             }), 200  # Return 200 so the frontend shows the message properly
         
         # Generic error
@@ -155,6 +239,64 @@ def chat():
             "error": "Failed to generate response",
             "response": f"Sorry, I encountered an error: {error_msg}. Please try again.",
         }), 200  # Return 200 so error message displays properly
+
+
+@app.route("/clear", methods=["POST"])
+def clear_conversation():
+    """
+    Clears conversation history for a session
+    
+    Expected JSON payload:
+    {
+        "session_id": "unique-session-id"
+    }
+    """
+    try:
+        data = request.json
+        session_id = data.get("session_id", "default")
+        
+        if session_id in conversations:
+            del conversations[session_id]
+            return jsonify({
+                "message": "Conversation history cleared",
+                "session_id": session_id
+            })
+        else:
+            return jsonify({
+                "message": "No conversation found for this session",
+                "session_id": session_id
+            })
+            
+    except Exception as e:
+        return jsonify({
+            "error": "Failed to clear conversation",
+            "message": str(e)
+        }), 500
+
+
+@app.route("/history", methods=["GET"])
+def get_history():
+    """
+    Gets conversation history for a session
+    
+    Query parameter:
+        session_id: unique-session-id (default: "default")
+    """
+    try:
+        session_id = request.args.get("session_id", "default")
+        history = get_conversation_history(session_id)
+        
+        return jsonify({
+            "session_id": session_id,
+            "message_count": len(history),
+            "history": history
+        })
+            
+    except Exception as e:
+        return jsonify({
+            "error": "Failed to retrieve history",
+            "message": str(e)
+        }), 500
 
 
 @app.route("/health", methods=["GET"])
@@ -165,8 +307,11 @@ def health():
     return jsonify({
         "status": "healthy",
         "api_configured": bool(API_KEY),
+        "active_sessions": len(conversations),
         "endpoints": {
             "chat": "/chat (POST)",
+            "clear": "/clear (POST)",
+            "history": "/history (GET)",
             "health": "/health (GET)",
             "home": "/ (GET)"
         }
@@ -178,7 +323,7 @@ def not_found(e):
     return jsonify({
         "error": "Endpoint not found",
         "message": "The requested endpoint does not exist",
-        "available_endpoints": ["/", "/chat", "/health"]
+        "available_endpoints": ["/", "/chat", "/clear", "/history", "/health"]
     }), 404
 
 @app.errorhandler(405)
@@ -202,18 +347,21 @@ if __name__ == "__main__":
     print(f"📡 Server running at: http://127.0.0.1:5000")
     print(f"🤖 AI Model: gemini-2.5-flash")
     print(f"✅ API Key configured: {'Yes' if API_KEY else 'No'}")
+    print(f"💬 Conversation memory: Enabled")
     print("=" * 50)
     print("📍 Available endpoints:")
     print("   GET  /          - Server info")
     print("   GET  /health    - Health check")
     print("   POST /chat      - Chat with ChefBot")
+    print("   POST /clear     - Clear conversation history")
+    print("   GET  /history   - View conversation history")
     print("=" * 50)
     print("🔥 Ready to cook! Press CTRL+C to stop.")
     print("=" * 50)
     
     # Run Flask server
     app.run(
-        host="127.0.0.1",
+        host="0.0.0.0",
         port=5000,
         debug=True,
         use_reloader=True

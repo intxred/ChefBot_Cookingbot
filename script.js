@@ -233,7 +233,7 @@ function addBotMessageToDOM(message, scroll = true, animate = true) {
 
         if (animate) {
             let i = 0;
-            const speed = 15;
+            const speed = 3;
 
             (function tick() {
                 if (stopRequested) { typingResolve = null; resolve(); return; }

@@ -1,0 +1,15 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Copy Python server
+COPY chefbot_server.py .
+
+# Install dependencies
+RUN pip install flask flask-cors requests
+
+# Expose Python API port
+EXPOSE 5000
+
+# Run the Python server
+CMD ["python", "chefbot_server.py"]
